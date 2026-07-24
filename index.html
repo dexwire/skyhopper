@@ -121,6 +121,7 @@
     <div class="howto">
       <div class="howto-item"><div class="howto-icon">🕹️</div><div class="howto-label">Left stick<br>Move left / right</div></div>
       <div class="howto-item"><div class="howto-icon">🦘</div><div class="howto-label">Bouncing is<br>automatic!</div></div>
+      <div class="howto-item"><div class="howto-icon">✨</div><div class="howto-label">Any button<br>Warp to teammate (5s)</div></div>
       <div class="howto-item"><div class="howto-icon">☰</div><div class="howto-label">Start<br>Pause</div></div>
     </div>
 
@@ -151,7 +152,7 @@ const CONFIG = {
     pDark: ['#1d4ed8', '#b91c1c', '#15803d', '#b45309'],
   },
   player: {
-    radius: 22,
+    radius: 30,
     gravity: 1500,
     jumpVel: -760,
     springVel: -1150,
@@ -160,11 +161,12 @@ const CONFIG = {
     maxTilt: 0.4,
   },
   platform: {
-    height: 18,
-    widthStart: 110, widthEnd: 90,
+    height: 26,
+    widthStart: 150, widthEnd: 120,
     gapMin: 62, gapMinHigh: 83,
     gapMax: 100, gapMaxHigh: 139,
     maxHorizontalStep: 260,
+    reachSafety: 0.8,
     safeZoneHeight: 190,
     difficultyMaxHeight: 6000,
   },
@@ -173,6 +175,10 @@ const CONFIG = {
     followSpeed: 2.6,
     missBuffer: 70,
     lookahead: 0.55,
+  },
+  teleport: {
+    cooldown: 5,
+    buttons: [0,1,2,3],
   },
   scoreScale: 1/8,
 };
@@ -202,6 +208,7 @@ function sfxBounce(){ beep(300,0.09,'sine',0.14,420); }
 function sfxSpring(){ beep(300,0.22,'sine',0.18,900); }
 function sfxCrack(){ beep(160,0.14,'sawtooth',0.14,90); }
 function sfxMiss(){ beep(420,0.28,'triangle',0.18,140); }
+function sfxTeleport(){ beep(260,0.2,'sine',0.16,980); }
 function sfxJoin(){ beep(660,0.1,'sine',0.14,880); }
 
 /* ============================== CANVAS SETUP ============================== */
@@ -222,7 +229,7 @@ resize();
 const Input = {
   gamepadSlots: [null,null,null,null],
   prevButtons: [{}, {}, {}, {}],
-  keyboard: { left:false, right:false, startPressed:false },
+  keyboard: { left:false, right:false, startPressed:false, teleportHeld:false },
 };
 
 window.addEventListener('gamepadconnected', (e)=>{
@@ -251,10 +258,12 @@ window.addEventListener('keydown', (e)=>{
   if(['a','arrowleft'].includes(e.key.toLowerCase())) Input.keyboard.left = true;
   if(['d','arrowright'].includes(e.key.toLowerCase())) Input.keyboard.right = true;
   if(e.key === 'Enter') Input.keyboard.startPressed = true;
+  if(e.key === ' '){ Input.keyboard.teleportHeld = true; e.preventDefault(); }
 });
 window.addEventListener('keyup', (e)=>{
   if(['a','arrowleft'].includes(e.key.toLowerCase())) Input.keyboard.left = false;
   if(['d','arrowright'].includes(e.key.toLowerCase())) Input.keyboard.right = false;
+  if(e.key === ' ') Input.keyboard.teleportHeld = false;
 });
 
 function updateMenuSlots(){
@@ -279,13 +288,19 @@ function readMoveAxis(gp){
 function updateInputForPlayer(p){
   const pads = navigator.getGamepads ? navigator.getGamepads() : [];
   const gpIndex = Input.gamepadSlots[p.slot];
-  let mx = 0;
+  let mx = 0, teleportHeld = false;
   if(gpIndex !== null && pads[gpIndex]){
-    mx = readMoveAxis(pads[gpIndex]);
+    const gp = pads[gpIndex];
+    mx = readMoveAxis(gp);
+    teleportHeld = CONFIG.teleport.buttons.some(idx => gp.buttons[idx] && gp.buttons[idx].pressed);
   } else if(p.slot === 0){
     mx = (Input.keyboard.right?1:0) - (Input.keyboard.left?1:0);
+    teleportHeld = Input.keyboard.teleportHeld;
   }
-  return mx;
+  const prevTp = Input.prevButtons[p.slot].teleport || false;
+  const teleportPressed = teleportHeld && !prevTp;
+  Input.prevButtons[p.slot].teleport = teleportHeld;
+  return {mx, teleportPressed};
 }
 function checkPauseInput(){
   if(state!=='playing' && state!=='paused') return;
@@ -318,6 +333,7 @@ let sessionBestHeight = 0;
 let highestGenY = 0;
 let highestCloudGenY = 0;
 let lastPlatformX = 0;
+let lastLaunchSpeed = 760;
 let clock = 0;
 let lastTime = 0;
 
@@ -345,6 +361,29 @@ function pickPlatformType(height){
   return 'normal';
 }
 
+// --- Reachability guarantee --------------------------------------------------
+// Rather than relying on hand-tuned constants that merely "usually" work, every
+// gap and horizontal offset is checked against the actual jump physics (gravity,
+// launch speed, top speed) with a safety margin, so no generated jump can ever
+// be physically impossible.
+function maxArcHeight(launchSpeed){
+  return (launchSpeed*launchSpeed) / (2*CONFIG.player.gravity);
+}
+function descendTime(gap, launchSpeed){
+  const g = CONFIG.player.gravity;
+  const disc = launchSpeed*launchSpeed - 2*g*gap;
+  if(disc <= 0) return null; // shouldn't happen once gap is clamped, but guard anyway
+  return (launchSpeed + Math.sqrt(disc)) / g; // time of the falling-side crossing
+}
+function reachableDistance(t){
+  const {maxSpeed, accel} = CONFIG.player;
+  return maxSpeed*t - (maxSpeed/accel)*(1-Math.exp(-accel*t));
+}
+function clampGapToReachable(gap, launchSpeed){
+  const maxSafeGap = maxArcHeight(launchSpeed) * CONFIG.platform.reachSafety;
+  return clamp(gap, 30, maxSafeGap);
+}
+
 /* ============================== ENTITY FACTORIES ============================== */
 function makePlayer(slot, x){
   return {
@@ -354,36 +393,41 @@ function makePlayer(slot, x){
     color: CONFIG.colors.p[slot],
     dark: CONFIG.colors.pDark[slot],
     ownHeight: 0,
+    teleportCooldown: 0,
   };
 }
 
-function nextPlatformX(w){
+function nextPlatformX(w, gap, launchSpeed){
   const half = w/2;
   const minX = half+16, maxX = W-half-16;
-  const x = lastPlatformX + rand(-CONFIG.platform.maxHorizontalStep, CONFIG.platform.maxHorizontalStep);
+  const t = descendTime(gap, launchSpeed) || 0.5;
+  const maxStep = Math.min(CONFIG.platform.maxHorizontalStep, Math.max(60, reachableDistance(t)*CONFIG.platform.reachSafety));
+  const x = lastPlatformX + rand(-maxStep, maxStep);
   return clamp(x, minX, maxX);
 }
 
-function spawnPlatformAt(y, height){
+function spawnPlatformAt(y, height, gap, launchSpeed){
   const type = pickPlatformType(height);
   const w = widthForHeight(height);
-  const x = nextPlatformX(w);
+  const x = nextPlatformX(w, gap, launchSpeed);
   lastPlatformX = x;
   platforms.push({
     x, y, w, h: CONFIG.platform.height,
     type, baseX: x,
-    moveRange: rand(50,110), moveSpeed: rand(0.6,1.1), movePhase: rand(0,Math.PI*2),
+    moveRange: rand(30,60), moveSpeed: rand(0.6,1.1), movePhase: rand(0,Math.PI*2),
     used:false, crumble:0,
   });
+  return type;
 }
 
 function ensurePlatformsGenerated(){
   const targetTopY = camera.worldTop - H*CONFIG.camera.lookahead;
   while(highestGenY > targetTopY){
     const height = -highestGenY;
-    const gap = gapForHeight(Math.max(0,height));
+    const gap = clampGapToReachable(gapForHeight(Math.max(0,height)), lastLaunchSpeed);
     highestGenY -= gap;
-    spawnPlatformAt(highestGenY, Math.max(0,height));
+    const type = spawnPlatformAt(highestGenY, Math.max(0,height), gap, lastLaunchSpeed);
+    lastLaunchSpeed = (type==='spring') ? Math.abs(CONFIG.player.springVel) : Math.abs(CONFIG.player.jumpVel);
   }
 }
 
@@ -433,6 +477,7 @@ function startGame(){
   highestGenY = 0;
   highestCloudGenY = 0;
   lastPlatformX = W/2;
+  lastLaunchSpeed = Math.abs(CONFIG.player.jumpVel);
   camera.worldTop = -H*0.85;
   bestHeightEver = 0;
   clock = 0;
@@ -462,10 +507,14 @@ function togglePause(){
 /* ============================== UPDATE ============================== */
 function updatePlayers(dt){
   for(const p of players){
-    const mx = updateInputForPlayer(p);
+    const inp = updateInputForPlayer(p);
+    const mx = inp.mx;
     const targetVx = mx * CONFIG.player.maxSpeed;
     p.vx = lerp(p.vx, targetVx, clamp(dt*CONFIG.player.accel,0,1));
     p.tilt = lerp(p.tilt, clamp(p.vx/CONFIG.player.maxSpeed,-1,1)*CONFIG.player.maxTilt, clamp(dt*8,0,1));
+
+    p.teleportCooldown = Math.max(0, p.teleportCooldown - dt);
+    if(inp.teleportPressed && p.teleportCooldown<=0) tryTeleport(p);
 
     p.vy += CONFIG.player.gravity*dt;
     const prevY = p.y;
@@ -520,6 +569,26 @@ function bouncePlayer(p, plat){
     plat.crumble = 0.001; // start crumble timer next update
     sfxCrack();
   }
+}
+
+function tryTeleport(p){
+  let leader = null;
+  for(const other of players){
+    if(other===p) continue;
+    if(!leader || other.y < leader.y) leader = other;
+  }
+  if(!leader) return; // no teammates to warp to yet
+
+  spawnDust(p.x, p.y, p.color);
+  const r = CONFIG.player.radius;
+  p.x = clamp(leader.x + rand(-40,40), r+4, W-r-4);
+  p.y = leader.y - 10;
+  p.vx = 0;
+  p.vy = CONFIG.player.jumpVel*0.7;
+  p.teleportCooldown = CONFIG.teleport.cooldown;
+  spawnDust(p.x, p.y, p.color);
+  addPopup(p.x, p.y-30, 'Warp!', p.color);
+  sfxTeleport();
 }
 
 function updatePlatforms(dt){
@@ -629,17 +698,19 @@ function drawPlatform(plat){
   ctx.fill(); ctx.stroke();
 
   if(plat.type==='breakable'){
-    ctx.strokeStyle = 'rgba(60,40,20,0.5)'; ctx.lineWidth=1.5;
+    const cw = plat.w*0.32;
+    ctx.strokeStyle = 'rgba(60,40,20,0.5)'; ctx.lineWidth=2;
     ctx.beginPath();
-    ctx.moveTo(plat.x-18, sy-6); ctx.lineTo(plat.x-4, sy+5); ctx.lineTo(plat.x+10, sy-4);
+    ctx.moveTo(plat.x-cw, sy-7); ctx.lineTo(plat.x-cw*0.2, sy+7); ctx.lineTo(plat.x+cw*0.6, sy-6);
     ctx.stroke();
   }
   if(plat.type==='spring'){
-    ctx.strokeStyle = '#78350f'; ctx.lineWidth=3;
+    const sw = plat.w*0.2;
+    ctx.strokeStyle = '#78350f'; ctx.lineWidth=3.5;
     ctx.beginPath();
     for(let i=0;i<3;i++){
-      const yy = sy - plat.h/2 - i*5;
-      ctx.moveTo(plat.x-10, yy); ctx.lineTo(plat.x+10, yy-4);
+      const yy = sy - plat.h/2 - i*7;
+      ctx.moveTo(plat.x-sw, yy); ctx.lineTo(plat.x+sw, yy-6);
     }
     ctx.stroke();
   }
@@ -678,6 +749,31 @@ function drawPlayer(p){
   ctx.strokeStyle='rgba(0,0,0,0.35)'; ctx.lineWidth=3;
   ctx.strokeText('P'+(p.slot+1), p.x, sy-r-10);
   ctx.fillText('P'+(p.slot+1), p.x, sy-r-10);
+
+  // teleport cooldown badge (only meaningful with a teammate to warp to)
+  if(players.length > 1){
+    const badgeR = 13, bx = p.x + r*0.72, by = sy + r*0.62;
+    const ready = p.teleportCooldown <= 0;
+    ctx.save();
+    ctx.beginPath();
+    ctx.fillStyle = 'rgba(20,20,30,0.55)';
+    ctx.arc(bx,by,badgeR,0,Math.PI*2); ctx.fill();
+    if(ready){
+      ctx.font = '14px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText('⚡', bx, by+1);
+    } else {
+      const frac = 1 - clamp(p.teleportCooldown/CONFIG.teleport.cooldown, 0, 1);
+      ctx.beginPath();
+      ctx.moveTo(bx,by);
+      ctx.arc(bx,by,badgeR, -Math.PI/2, -Math.PI/2 + frac*Math.PI*2);
+      ctx.closePath();
+      ctx.fillStyle = p.color;
+      ctx.fill();
+    }
+    ctx.strokeStyle='rgba(255,255,255,0.7)'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(bx,by,badgeR,0,Math.PI*2); ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function drawLeaderCrown(){
